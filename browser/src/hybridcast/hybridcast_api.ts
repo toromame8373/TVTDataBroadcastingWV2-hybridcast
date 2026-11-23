@@ -9,7 +9,9 @@
  *
  * 方針: 実装できない機能は「成功したふり」をしない。
  *   - 受信機が実際に行えない操作(別ストリームの選択、字幕など)は false を返す(仕様の「失敗」)
- *   - 未実装のAPI(ReceiverDevice, EIT検索, 端末連携など 3.1.6 以降)は定義しない(機能検出で未対応と分かる)
+ *   - 未実装のAPI(EIT検索など 3.1.6 以降)は定義しない(機能検出で未対応と分かる)
+ *   - ただし bmlCompat と ReceiverDevice は、実在のライブラリ(NHK nhkhc)が機能検出なしに
+ *     触って例外で全体が止まるため、文書内に閉じた実装を定義する(各所に実機との差を明記)
  */
 import { hasFullPermission, isValidManagedUrl, type PermissionManagedArea } from "./boundary";
 
@@ -268,9 +270,92 @@ export function installHybridcastApi(win: any, init: AppInit, transport: Transpo
 
     const bmlCompat = { browserPseudo };
 
+    // --- 受信機デバイスオブジェクト(navigator.receiverDevice) -----------------------
+    // ハイブリッドキャスト受信機に標準で存在するオブジェクト(IPTVFJ STD-0011 の
+    // ReceiverDevice)。nhkhc は UA に Hybridcast/ を含む場合、初期化で無防備に触る:
+    // receiverDevice が未定義だと navigator.receiverDevice.streamEvent の読み取りで
+    // 例外になり、bmlCompat のときと同様にライブラリ全体が停止する(2026-11-23 実機ログ)。
+    // nhkhc-2.2.0.min.js の全12箇所の利用は次のとおり(実物で列挙):
+    //   streamEvent.sourceIs("onair")                 … NVRAM書込を行うかの判定(1箇所)
+    //   streamEvent.addEventIDUpdateListener(fn)      … 番組情報の更新通知の登録(2箇所)
+    //   streamEvent.addGeneralEventMessageListener(desc, fn) /
+    //   streamEvent.removeGeneralEventMessageListener(desc, fn)
+    //                                                 … 緊急情報メッセージの登録/解除(各2箇所、try/catch内)
+    //   getCurrentEventInformation(fn)                … 現在の番組情報の取得(2箇所)
+    //   sendTextToCompanionDevice(text)               … 端末連携への送信(1箇所、戻り値は未使用)
+    //   addCompanionDeviceTextMessageListener(fn)     … 端末連携からの受信登録(1箇所)
+    //   setURLForCompanionDevice(url, options)        … 端末連携へのURL提示(1箇所、戻り値は未使用)
+    // 実装方針(bmlCompat と同じ、文書内に閉じた実装):
+    //   - sourceIs("onair") は true。このプラグインではアプリは選局中の放送から起動し、
+    //     選局が変わればアプリは終了するので、アプリの生存中は常に対象の放送を受信している。
+    //     それ以外のソースは false(受信していないものを主張しない)。true を返すことで、
+    //     nhkhc の NVRAM 書き込みは browserPseudo 側へ実際に行われ、読み戻しと一致する
+    //     (false だと「書き込まずに成功扱い」になり、後段の検証と食い違う)。
+    //   - 番組情報(EIT)をホストから文書へ届ける経路は無いため、getCurrentEventInformation は
+    //     コールバックを undefined で呼ぶ。nhkhc は undefined を「情報なし」として扱い、
+    //     自前の初期値で初期化を続行する設計なので、これで初期化は完了する。番組情報は
+    //     捏造しない。addEventIDUpdateListener のリスナーも発火しない(nhkhc には数秒後の
+    //     フォールバック経路があり、そちらでも初期化は完了する)。
+    //   - 一般イベントメッセージ(緊急情報)もホストから届かないため、登録だけ受けて発火しない。
+    //     setEmergency の登録自体は成功するが、緊急情報の通知はアプリに届かない(実機との差)。
+    //   - 端末連携(コンパニオンデバイス)はホスト未対応のため、送信はどこにも届かず、
+    //     受信リスナーも発火しない(実機で連携機器が存在しない場合に相当する振る舞い)。
+    const eventIDUpdateListeners = new Set<unknown>();
+    const generalEventMessageListeners = new Set<{ messageGroupId: unknown; messageId: unknown; listener: unknown }>();
+    const companionTextMessageListeners = new Set<unknown>();
+
+    const streamEvent = {
+        sourceIs(source: unknown): boolean {
+            return source === "onair";
+        },
+        addEventIDUpdateListener(listener: unknown): void {
+            if (typeof listener === "function") eventIDUpdateListeners.add(listener);
+        },
+        // nhkhc は使わないが、add と対になる解除も用意する
+        removeEventIDUpdateListener(listener: unknown): void {
+            eventIDUpdateListeners.delete(listener);
+        },
+        addGeneralEventMessageListener(descriptor: any, listener: unknown): void {
+            if (typeof listener !== "function") return;
+            generalEventMessageListeners.add({
+                messageGroupId: descriptor?.message_group_id,
+                messageId: descriptor?.message_id,
+                listener,
+            });
+        },
+        removeGeneralEventMessageListener(descriptor: any, listener: unknown): void {
+            for (const entry of generalEventMessageListeners) {
+                if (entry.listener === listener &&
+                    entry.messageGroupId === descriptor?.message_group_id &&
+                    entry.messageId === descriptor?.message_id) {
+                    generalEventMessageListeners.delete(entry);
+                }
+            }
+        },
+    };
+
+    const receiverDevice = {
+        streamEvent,
+        getCurrentEventInformation(callback: unknown): void {
+            if (typeof callback !== "function") return;
+            // 番組情報は提供できないため、undefined(情報なし)で応答する
+            win.setTimeout(() => (callback as (info: undefined) => void)(undefined), 0);
+        },
+        sendTextToCompanionDevice(_text: unknown): void {
+            // 連携機器は存在しないため、送信はどこにも届かない
+        },
+        addCompanionDeviceTextMessageListener(listener: unknown): void {
+            if (typeof listener === "function") companionTextMessageListeners.add(listener);
+        },
+        setURLForCompanionDevice(_url: unknown, _options?: unknown): void {
+            // 連携機器は存在しないため、提示先がない
+        },
+    };
+
     define(nav, "applicationManager", applicationManager);
     define(nav, "capabilities", capabilities);
     define(nav, "bmlCompat", bmlCompat);
+    define(nav, "receiverDevice", receiverDevice);
 
     // --- 放送映像音声オブジェクト --------------------------------------------------
     function augment(el: any) {
