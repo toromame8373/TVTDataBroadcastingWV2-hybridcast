@@ -1,3 +1,7 @@
+# msbuild-hybridcast.yml に対する差分は1ステップのみ:
+# 「install npm packages」の直後に「Apply web-bml overlay (web-bml-files)」を追加。
+# これが無いと CI 製バンドルでは BML からハイブリッドキャストを起動できなくなる
+# (rebuild-browser.bat の [3/4] と等価の上書き。詳細は HYBRIDCAST_LAUNCH_REPORT.md)。
 name: MSBuild
 
 on:
@@ -67,6 +71,16 @@ jobs:
     - name: install npm packages
       working-directory: ./browser/
       run: npm ci
+
+    # web-bml 本体への差し替え(rebuild-browser.bat [3/4] と等価)。
+    # startAITControlledApp 等のBML側の起動関数はこの上書きで初めて入る。
+    # 検証文字列は rebuild-browser.bat の findstr 条件と同じ。
+    - name: Apply web-bml overlay (web-bml-files)
+      working-directory: ./browser/
+      run: |
+        Copy-Item -Recurse -Force ../web-bml-files/dist/* node_modules/web-bml/dist/
+        if (-not (Select-String -Path node_modules/web-bml/dist/client/browser.js -Pattern 'startAITControlledApp' -Quiet)) { throw 'web-bml overlay was not applied: startAITControlledApp missing in web-bml browser.js' }
+        if (-not (Select-String -Path node_modules/web-bml/dist/client/browser.js -Pattern 'AITTransportMethod' -Quiet)) { throw 'web-bml overlay was not applied: AITTransportMethod missing in web-bml browser.js' }
 
     - name: Build web-bml
       working-directory: ./browser/
