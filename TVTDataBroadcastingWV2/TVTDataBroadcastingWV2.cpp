@@ -1126,7 +1126,9 @@ void CDataBroadcastingWV2::InitWebView2()
     auto resourceDirectory = this->GetIniItem(L"ResourceDirectory", this->resourceDirectory.c_str());
     if (!std::filesystem::is_directory(resourceDirectory))
     {
-        MessageBoxW(this->m_pApp->GetAppWindow(), (L"リソースディレクトリが見つかりません。\n" + resourceDirectory).c_str(), L"TVTDataBroadcastingWV2", MB_ICONERROR | MB_OK);
+        // モーダルダイアログは出さない。AutoEnable 時は TVTest 起動直後にここを通るため、
+        // ダイアログがメインウィンドウの裏に隠れると TVTest 全体がフリーズしたように見える。
+        this->m_pApp->AddLog((L"TVTDataBroadcastingWV2: リソースディレクトリが見つかりません。 " + resourceDirectory).c_str(), TVTest::LOG_TYPE_ERROR);
         this->m_pApp->EnablePlugin(false);
         return;
     }
@@ -1145,7 +1147,7 @@ void CDataBroadcastingWV2::InitWebView2()
         {
             wchar_t buf[9]{};
             _itow_s(result, buf, 16);
-            MessageBoxW(this->m_pApp->GetAppWindow(), (std::wstring(L"WebView2を初期化できませんでした。(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler)\nHRESULT = 0x") + buf).c_str(), L"TVTDataBroadcastingWV2", MB_ICONERROR | MB_OK);
+            this->m_pApp->AddLog((std::wstring(L"TVTDataBroadcastingWV2: WebView2を初期化できませんでした。(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler) HRESULT = 0x") + buf).c_str(), TVTest::LOG_TYPE_ERROR);
             this->m_pApp->EnablePlugin(false);
             return S_OK;
         }
@@ -1160,7 +1162,7 @@ void CDataBroadcastingWV2::InitWebView2()
             {
                 wchar_t buf[9]{};
                 _itow_s(result, buf, 16);
-                MessageBoxW(this->m_pApp->GetAppWindow(), (std::wstring(L"WebView2を初期化できませんでした。(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler)\nHRESULT = 0x") + buf).c_str(), L"TVTDataBroadcastingWV2", MB_ICONERROR | MB_OK);
+                this->m_pApp->AddLog((std::wstring(L"TVTDataBroadcastingWV2: WebView2を初期化できませんでした。(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler) HRESULT = 0x") + buf).c_str(), TVTest::LOG_TYPE_ERROR);
                 this->m_pApp->EnablePlugin(false);
                 return S_OK;
             }
@@ -1174,7 +1176,7 @@ void CDataBroadcastingWV2::InitWebView2()
             auto controller2 = this->webViewController.try_query<ICoreWebView2Controller2>();
             if (!controller2)
             {
-                MessageBoxW(this->m_pApp->GetAppWindow(), L"WebView2のバージョンが古すぎます。", L"TVTDataBroadcastingWV2", MB_ICONERROR | MB_OK);
+                this->m_pApp->AddLog(L"TVTDataBroadcastingWV2: WebView2のバージョンが古すぎます。", TVTest::LOG_TYPE_ERROR);
             }
             else
             {
@@ -1664,11 +1666,11 @@ void CDataBroadcastingWV2::InitWebView2()
 
         if (result == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
         {
-            MessageBoxW(this->m_pApp->GetAppWindow(), (std::wstring(L"WebView2を初期化できませんでした。(CreateCoreWebView2EnvironmentWithOptions)\nWebView2がインストールされていない可能性があります。\nHRESULT = 0x") + buf).c_str(), L"TVTDataBroadcastingWV2", MB_ICONERROR | MB_OK);
+            this->m_pApp->AddLog((std::wstring(L"TVTDataBroadcastingWV2: WebView2を初期化できませんでした。(CreateCoreWebView2EnvironmentWithOptions) WebView2がインストールされていない可能性があります。 HRESULT = 0x") + buf).c_str(), TVTest::LOG_TYPE_ERROR);
         }
         else
         {
-            MessageBoxW(this->m_pApp->GetAppWindow(), (std::wstring(L"WebView2を初期化できませんでした。(CreateCoreWebView2EnvironmentWithOptions)\nHRESULT = 0x") + buf).c_str(), L"TVTDataBroadcastingWV2", MB_ICONERROR | MB_OK);
+            this->m_pApp->AddLog((std::wstring(L"TVTDataBroadcastingWV2: WebView2を初期化できませんでした。(CreateCoreWebView2EnvironmentWithOptions) HRESULT = 0x") + buf).c_str(), TVTest::LOG_TYPE_ERROR);
         }
         this->m_pApp->EnablePlugin(false);
     }
