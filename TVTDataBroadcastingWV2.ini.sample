@@ -1,0 +1,16 @@
+; TVTDataBroadcastingWV2.ini (sample)
+; Copy this file to "TVTDataBroadcastingWV2.ini" (same folder as TVTDataBroadcastingWV2.tvtp) and edit.
+; Use ANSI/ASCII text only in this file.
+[TVTDataBroadcastingWV2]
+; 1 = allow network access (required for Hybridcast and BML network features)
+EnableNetwork=1
+; Hybridcast log file: Plugins\TVTDataBroadcastingWV2\hybridcast.log  (1 = write, 0 = do not write)
+HybridcastLog=1
+; 1 = also log the query string of URLs (may contain personal data). Default 0: query strings are omitted.
+HybridcastLogFullUrl=0
+; Values sent in the User-Agent header to Hybridcast servers: Hybridcast/1.0 (HD,HD;<MakerId>;<ModelId>;1;0;)
+; MakerId = IEEE OUI (6 hex digits). Do not use another company ID. 000000 means "not registered".
+HybridcastMakerId=000000
+HybridcastModelId=TVTDataBroadcastingWV2
+; Test hook: start the Hybridcast app of this AIT URL once per service (normally BML starts it).
+;HybridcastAitUrl=http://hc.nhk.or.jp/p/nhkp.ait

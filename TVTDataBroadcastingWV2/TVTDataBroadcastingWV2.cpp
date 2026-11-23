@@ -4,6 +4,9 @@
 #include "thirdparty/TVTestPlugin.h"
 #include "resource.h"
 #include <queue>
+#include <vector>
+#include <fstream>
+#include <filesystem>
 #include <optional>
 #include <wil/stl.h>
 #include <wil/win32_helpers.h>
@@ -24,6 +27,8 @@ using namespace Microsoft::WRL;
 #define WM_APP_RESPONSE (WM_APP + 2)
 #define WM_APP_INPUT (WM_APP + 3)
 #define WM_APP_ENABLE_PLUGIN (WM_APP + 4)
+// バウンダリ外への文書遷移を検出したので、ハイブリッドキャストアプリを終了する(wParam: 放送受信映像のみにするか)
+#define WM_APP_HYBRIDCAST_EXIT (WM_APP + 5)
 
 // サイドパネル向けメッセージ
 #define WM_APP_ON_PANEL_COLOR_CHANGE (WM_APP + 0)
@@ -285,6 +290,40 @@ class CDataBroadcastingWV2 : public TVTest::CTVTestPlugin, TVTest::CTVTestEventH
     std::wstring resourceDirectory;
     // Plugins/TVTDataBroadcastingWV2/WebView2Data/
     std::wstring webView2DataDirectory;
+    // ハイブリッドキャスト(HTMLアプリ)の実行状態
+    struct HybridcastState
+    {
+        // マネージド状態(放送マネージドアプリを実行中)
+        bool active = false;
+        // アンマネージド状態(exitFromManagedState で一般アプリを閲覧中)
+        bool unmanaged = false;
+        // 起動処理中(スクリプト登録の完了待ち)
+        bool launching = false;
+        // アプリケーションバウンダリ(文書遷移してよいURL。前方一致、ディレクトリ境界あり)
+        std::vector<std::wstring> boundary;
+        // AddScriptToExecuteOnDocumentCreated の戻りID
+        std::wstring scriptId;
+        // 起動時のサービス。選局で別のサービスになったらアプリを終了する
+        int networkId = 0;
+        int serviceId = 0;
+        // 試験用のAIT自動起動を済ませたサービス(networkId << 16 | serviceId)。0は未実施
+        long long consumedKey = 0;
+        // 「放送受信映像のみ」で戻るサービス(networkId << 16 | serviceId)。0は無し
+        long long videoOnlyKey = 0;
+        // アンマネージド中に映像・音声を止めるための退避
+        bool savedMuteValid = false;
+        bool savedMute = false;
+        // 元のUser-Agent(アプリ実行中だけ仕様の書式にするため)
+        std::wstring savedUserAgent;
+        // resources/dist/hybridcast_api.js
+        std::wstring apiScriptPath;
+    } hybridcast;
+    // ハイブリッドキャストのログ(Plugins\TVTDataBroadcastingWV2\hybridcast.log)
+    std::mutex hybridcastLogMutex;
+    bool hybridcastLogEnabled = true;
+    bool hybridcastLogFullUrl = false;
+    int hybridcastLogLines = 0;
+    std::vector<wil::com_ptr<ICoreWebView2DevToolsProtocolEventReceiver>> hybridcastDevToolsReceivers;
     // Plugins/TVTDataBroadcastingWV2/WebView2/
     std::wstring webView2Directory;
 
@@ -352,6 +391,20 @@ class CDataBroadcastingWV2 : public TVTest::CTVTestPlugin, TVTest::CTVTestEventH
     void RestoreVideoWindow();
     void ResizeVideoWindow();
     void Tune();
+    bool InHybridcastMode() const { return this->hybridcast.active || this->hybridcast.unmanaged; }
+    bool IsInHybridcastBoundary(const wchar_t* url) const;
+    std::wstring BuildHybridcastScript(const std::string& initJson) const;
+    std::wstring BuildHybridcastUserAgent(const std::wstring& baseUserAgent);
+    void OnHybridcastAppMessage(const std::string& type, const nlohmann::json& message);
+    void HybridcastLog(const wchar_t* level, const std::wstring& message);
+    std::wstring HybridcastLogUrl(const std::wstring& url);
+    void OnHybridcastNavigationStarting(ICoreWebView2NavigationStartingEventArgs* args, bool isMainFrame);
+    void OnHybridcastDevToolsEvent(bool isException, const wchar_t* json);
+    void LaunchHybridcast(const nlohmann::json& message);
+    void ExitHybridcast(bool videoOnly);
+    void EnterUnmanaged(const std::wstring& uri);
+    void LeaveHybridcastState();
+    void RestoreHybridcastMute();
     void InitWebView2();
     bool caption = false;
     void SetCaptionState(bool enable);
@@ -580,6 +633,9 @@ bool CDataBroadcastingWV2::Initialize()
     webView2Directory = path / L"WebView2";
     path.replace_extension(L".ini");
     this->iniFile = path;
+    // ハイブリッドキャストのログ。HybridcastLog=0 で無効、HybridcastLogFullUrl=1 でURLのクエリも記録する
+    this->hybridcastLogEnabled = this->GetIniItem(L"HybridcastLog", 1) != 0;
+    this->hybridcastLogFullUrl = this->GetIniItem(L"HybridcastLogFullUrl", 0) != 0;
     m_pApp->SetEventCallback(EventCallback, this);
     m_pApp->RegisterCommand(IDC_KEY_D, L"DataButton", L"dボタン");
     m_pApp->RegisterCommand(IDC_KEY_D_OR_ENABLE_PLUGIN, L"DataButtonOrEnablePlugin", L"プラグイン有効/dボタン");
@@ -885,6 +941,9 @@ LRESULT CALLBACK CDataBroadcastingWV2::MessageWndProc(HWND hWnd, UINT uMsg, WPAR
     case WM_APP_ENABLE_PLUGIN:
         pThis->m_pApp->EnablePlugin(true);
         return 0;
+    case WM_APP_HYBRIDCAST_EXIT:
+        pThis->ExitHybridcast(wParam != 0);
+        return 0;
     }
     return DefWindowProcW(hWnd, uMsg, wParam, lParam);
 }
@@ -1137,6 +1196,7 @@ void CDataBroadcastingWV2::InitWebView2()
             EventRegistrationToken token;
             auto webView3 = this->webView.query<ICoreWebView2_3>();
             webView3->SetVirtualHostNameToFolderMapping(L"TVTDataBroadcastingWV2.invalid", resourceDirectory.c_str(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+            this->hybridcast.apiScriptPath = (std::filesystem::path(resourceDirectory) / L"dist" / L"hybridcast_api.js").wstring();
 
             // 仮想ホスト以外へのリクエストは全てブロックする
             // 通信が有効になっている場合は内部のプロキシへの通信のみ許可する
@@ -1155,6 +1215,42 @@ void CDataBroadcastingWV2::InitWebView2()
                 {
                     return hr;
                 }
+                // 403を返してリクエストを遮断する
+                auto block = [&]() -> HRESULT {
+                    wil::com_ptr<ICoreWebView2Environment> env;
+                    HRESULT hr = this->webView.query<ICoreWebView2_2>()->get_Environment(env.put());
+                    if (FAILED(hr))
+                    {
+                        return hr;
+                    }
+                    wil::com_ptr<ICoreWebView2WebResourceResponse> response;
+                    hr = env->CreateWebResourceResponse(nullptr, 403, L"Blocked", L"", response.put());
+                    if (FAILED(hr))
+                    {
+                        return hr;
+                    }
+                    return args->put_Response(response.get());
+                };
+                if (this->InHybridcastMode())
+                {
+                    // ハイブリッドキャストのアプリ(外部ページ)の場合:
+                    // プラグインの仮想ホストと内部プロキシ(どちらも https://TVTDataBroadcastingWV2*.invalid)には触れさせない。
+                    // 内部プロキシは通信先を問わず取得できるため、外部ページに使わせてはいけない。
+                    const wchar_t* pluginHostPrefix = L"https://TVTDataBroadcastingWV2";
+                    if (!_wcsnicmp(uri.get(), pluginHostPrefix, wcslen(pluginHostPrefix)))
+                    {
+                        this->HybridcastLog(L"WARN", L"アプリからのプラグイン内部リソースへのアクセスを遮断しました: " + this->HybridcastLogUrl(uri.get()));
+                        return block();
+                    }
+                    // 画像・スクリプト・通信などの部品の取得は、アプリケーションバウンダリの対象外(STD-0010 7.6.1)。
+                    // バウンダリを判定するのは文書(HTML)の遷移で、NavigationStarting で行う。
+                    if (!_wcsnicmp(uri.get(), L"http://", 7) || !_wcsnicmp(uri.get(), L"https://", 8))
+                    {
+                        return S_OK;
+                    }
+                    this->HybridcastLog(L"WARN", L"アプリからの http/https 以外のリクエストを遮断しました: " + this->HybridcastLogUrl(uri.get()));
+                    return block();
+                }
                 auto get = L"https://TVTDataBroadcastingWV2-api.invalid/api/get/";
                 auto post = L"https://TVTDataBroadcastingWV2-api.invalid/api/post/";
                 LPCWSTR proxyUrl = nullptr;
@@ -1172,20 +1268,113 @@ void CDataBroadcastingWV2::InitWebView2()
                 }
                 else if (_wcsnicmp(L"https://TVTDataBroadcastingWV2.invalid/", uri.get(), wcslen(L"https://TVTDataBroadcastingWV2.invalid/")))
                 {
-                    wil::com_ptr<ICoreWebView2Environment> env;
-                    hr = this->webView.query<ICoreWebView2_2>()->get_Environment(env.put());
-                    if (FAILED(hr))
-                    {
-                        return hr;
-                    }
-                    wil::com_ptr<ICoreWebView2WebResourceResponse> response;
-                    hr = env->CreateWebResourceResponse(nullptr, 403, L"Blocked", L"", response.put());
-                    if (FAILED(hr))
-                    {
-                        return hr;
-                    }
-                    return args->put_Response(response.get());
+                    return block();
                 }
+                return S_OK;
+            }).Get(), &token);
+
+            // アプリケーションバウンダリ外への文書遷移(iframeを含む)を検出したら、アプリを終了して放送受信映像のみにする
+            // (IPTVFJ STD-0010 7.6.1 / STD-0013 8.1.3.10.2)。終了処理はメッセージで遅らせて実行する。
+            auto navigationStarting = Callback<ICoreWebView2NavigationStartingEventHandler>(
+                [this](ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                this->OnHybridcastNavigationStarting(args, true);
+                return S_OK;
+            });
+            auto frameNavigationStarting = Callback<ICoreWebView2NavigationStartingEventHandler>(
+                [this](ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                this->OnHybridcastNavigationStarting(args, false);
+                return S_OK;
+            });
+            this->webView->add_NavigationStarting(navigationStarting.Get(), &token);
+            this->webView->add_FrameNavigationStarting(frameNavigationStarting.Get(), &token);
+            // ハイブリッドキャストのアプリの読み込み結果(成功・失敗とエラーの種類)を記録する。HTTPのエラーは、下の応答の記録に出る
+            this->webView->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                [this](ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                if (!this->InHybridcastMode())
+                {
+                    return S_OK;
+                }
+                BOOL success = FALSE;
+                args->get_IsSuccess(&success);
+                COREWEBVIEW2_WEB_ERROR_STATUS errorStatus = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                args->get_WebErrorStatus(&errorStatus);
+                wil::unique_cotaskmem_string source;
+                std::wstring url;
+                if (SUCCEEDED(sender->get_Source(source.put())) && source)
+                {
+                    url = this->HybridcastLogUrl(source.get());
+                }
+                this->HybridcastLog(success ? L"INFO" : L"WARN",
+                    std::wstring(success ? L"読み込み完了" : L"読み込み失敗") +
+                    L" webErrorStatus=" + std::to_wstring((int)errorStatus) + L" " + url);
+                return S_OK;
+            }).Get(), &token);
+            // HTTPエラー(403 など)とリダイレクト先(Location)を記録する。ユーザーエージェントなどで弾かれた場合の手がかりになる
+            auto webView2 = this->webView.try_query<ICoreWebView2_2>();
+            if (webView2)
+            {
+                webView2->add_WebResourceResponseReceived(Callback<ICoreWebView2WebResourceResponseReceivedEventHandler>(
+                    [this](ICoreWebView2* sender, ICoreWebView2WebResourceResponseReceivedEventArgs* args) -> HRESULT {
+                    if (!this->InHybridcastMode())
+                    {
+                        return S_OK;
+                    }
+                    wil::com_ptr<ICoreWebView2WebResourceRequest> request;
+                    wil::com_ptr<ICoreWebView2WebResourceResponseView> response;
+                    if (FAILED(args->get_Request(request.put())) || FAILED(args->get_Response(response.put())))
+                    {
+                        return S_OK;
+                    }
+                    int status = 0;
+                    response->get_StatusCode(&status);
+                    if (status < 300)
+                    {
+                        return S_OK;
+                    }
+                    wil::unique_cotaskmem_string uri;
+                    request->get_Uri(uri.put());
+                    std::wstring text = L"HTTP " + std::to_wstring(status) + L" " + this->HybridcastLogUrl(uri ? uri.get() : L"");
+                    if (status < 400)
+                    {
+                        wil::com_ptr<ICoreWebView2HttpResponseHeaders> headers;
+                        wil::unique_cotaskmem_string location;
+                        if (SUCCEEDED(response->get_Headers(headers.put())) && headers &&
+                            SUCCEEDED(headers->GetHeader(L"Location", location.put())) && location)
+                        {
+                            text += L" -> " + this->HybridcastLogUrl(location.get());
+                        }
+                    }
+                    this->HybridcastLog(status >= 400 ? L"WARN" : L"INFO", text);
+                    return S_OK;
+                }).Get(), &token);
+            }
+            // アプリのJavaScriptの例外と console.error を記録する(DevToolsプロトコル)
+            for (const wchar_t* eventName : { L"Runtime.exceptionThrown", L"Runtime.consoleAPICalled" })
+            {
+                wil::com_ptr<ICoreWebView2DevToolsProtocolEventReceiver> receiver;
+                if (SUCCEEDED(this->webView->GetDevToolsProtocolEventReceiver(eventName, receiver.put())) && receiver)
+                {
+                    bool isException = !wcscmp(eventName, L"Runtime.exceptionThrown");
+                    receiver->add_DevToolsProtocolEventReceived(Callback<ICoreWebView2DevToolsProtocolEventReceivedEventHandler>(
+                        [this, isException](ICoreWebView2* sender, ICoreWebView2DevToolsProtocolEventReceivedEventArgs* args) -> HRESULT {
+                        if (!this->InHybridcastMode())
+                        {
+                            return S_OK;
+                        }
+                        wil::unique_cotaskmem_string json;
+                        if (SUCCEEDED(args->get_ParameterObjectAsJson(json.put())) && json)
+                        {
+                            this->OnHybridcastDevToolsEvent(isException, json.get());
+                        }
+                        return S_OK;
+                    }).Get(), &token);
+                    this->hybridcastDevToolsReceivers.push_back(receiver);
+                }
+            }
+            // ポップアップ(window.open など)は開かせない
+            this->webView->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                [](ICoreWebView2* sender, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+                args->put_Handled(TRUE);
                 return S_OK;
             }).Get(), &token);
 
@@ -1196,8 +1385,26 @@ void CDataBroadcastingWV2::InitWebView2()
                 {
                     auto messageUTF8 = wstrToUTF8String(message.get());
 
-                    auto a = nlohmann::json::parse(messageUTF8);
+                    // 例外を投げない解析(不正なJSONや型違いのメッセージでプロセスを落とさない)
+                    auto a = nlohmann::json::parse(messageUTF8, nullptr, false);
+                    if (a.is_discarded() || !a.is_object() || !a.contains("type") || !a["type"].is_string())
+                    {
+                        return S_OK;
+                    }
                     auto type = a["type"].get<std::string>();
+                    // 送信元がプラグイン自身のページでない場合(=ハイブリッドキャストのアプリ)は、
+                    // アプリ用に限定した経路でだけ処理する(tune などプラグイン用のメッセージは受け付けない)
+                    {
+                        wil::unique_cotaskmem_string source;
+                        const wchar_t* pluginPage = L"https://TVTDataBroadcastingWV2.invalid/";
+                        bool fromPlugin = SUCCEEDED(args->get_Source(source.put())) && source &&
+                            !_wcsnicmp(source.get(), pluginPage, wcslen(pluginPage));
+                        if (!fromPlugin)
+                        {
+                            this->OnHybridcastAppMessage(type, a);
+                            return S_OK;
+                        }
+                    }
                     if (type == "videoChanged")
                     {
                         auto left = a["left"].get<double>();
@@ -1214,6 +1421,20 @@ void CDataBroadcastingWV2::InitWebView2()
                         this->invisible = invisible;
                         this->videoRect = r;
                         this->ResizeVideoWindow();
+                    }
+                    else if (type == "hybridcastLaunch")
+                    {
+                        this->LaunchHybridcast(a);
+                    }
+                    else if (type == "hybridcastLog")
+                    {
+                        // データ放送側(BML)の橋渡しからのログ(AITの取得失敗、該当アプリなし など)
+                        if (a.contains("text") && a["text"].is_string())
+                        {
+                            std::string level = a.contains("level") && a["level"].is_string() ? a["level"].get<std::string>() : "info";
+                            std::wstring text = utf8StrToWString(a["text"].get<std::string>().substr(0, 600).c_str());
+                            this->HybridcastLog(level == "error" ? L"ERROR" : level == "warn" ? L"WARN" : L"INFO", L"[BML] " + text);
+                        }
                     }
                     else if (type == "invisible")
                     {
@@ -1706,10 +1927,45 @@ bool CDataBroadcastingWV2::OnPluginEnable(bool fEnable)
     return true;
 }
 
+namespace
+{
+std::wstring PercentEncode(const std::wstring& s)
+{
+    auto utf8 = wstrToUTF8String(s.c_str());
+    std::wstring out;
+    for (unsigned char c : utf8)
+    {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+        {
+            out += (wchar_t)c;
+        }
+        else
+        {
+            wchar_t buf[4];
+            swprintf_s(buf, L"%%%02X", c);
+            out += buf;
+        }
+    }
+    return out;
+}
+}
+
 void CDataBroadcastingWV2::Tune()
 {
     if (this->webView && this->currentService.ServiceID)
     {
+        // ハイブリッドキャストのアプリ実行中は、同じサービスのままなら画面を切り替えない。
+        // 選局で別のサービスになったら、アプリを終了して新しいサービスのデータ放送へ遷移する(STD-0013 8.1.3.10.1)。
+        if (this->InHybridcastMode())
+        {
+            if (this->hybridcast.serviceId == this->currentService.ServiceID &&
+                this->hybridcast.networkId == this->currentChannel.NetworkID)
+            {
+                return;
+            }
+            this->HybridcastLog(L"INFO", L"選局されたため、アプリを終了します");
+            this->LeaveHybridcastState();
+        }
         this->status = {};
         wil::unique_cotaskmem_string source;
         if (SUCCEEDED(this->webView->get_Source(source.put())))
@@ -1718,6 +1974,27 @@ void CDataBroadcastingWV2::Tune()
             baseUrl += std::to_wstring(this->currentService.ServiceID);
             baseUrl += L"&networkId=";
             baseUrl += std::to_wstring(this->currentChannel.NetworkID);
+            long long key = ((long long)this->currentChannel.NetworkID << 16) | this->currentService.ServiceID;
+            // アプリ終了後は「放送受信映像のみ」の状態で戻る(別のサービスになったら解除)
+            if (this->hybridcast.videoOnlyKey == key)
+            {
+                baseUrl += L"&videoOnly=1";
+            }
+            else
+            {
+                this->hybridcast.videoOnlyKey = 0;
+            }
+            // 試験用: iniの HybridcastAitUrl があれば、サービスごとに1回だけAITからの起動を試みる
+            if (this->hybridcast.consumedKey != key)
+            {
+                this->hybridcast.consumedKey = 0;
+                auto aitUrl = this->GetIniItem(L"HybridcastAitUrl", L"");
+                if (!aitUrl.empty())
+                {
+                    baseUrl += L"&hybridcastAit=";
+                    baseUrl += PercentEncode(aitUrl);
+                }
+            }
             if (_wcsicmp(source.get(), baseUrl.c_str()))
             {
                 this->oneSegWindow = nullptr;
@@ -1728,6 +2005,690 @@ void CDataBroadcastingWV2::Tune()
                 this->usedKey.numericTuning = false;
             }
         }
+    }
+}
+
+namespace
+{
+// バウンダリの判定に使うURLの要素(IPTVFJ STD-0013 6.1.3.1 表 6-1)。判定の規則は browser/src/hybridcast/boundary.ts と同じ。
+struct ParsedHttpUrl
+{
+    std::wstring scheme; // L"http" または L"https"
+    std::wstring host;   // 小文字
+    std::wstring port;   // 既定のポートは空
+    std::wstring path;   // "/" 始まり。パス指定のない managedURL では空
+    bool hasPath = false;
+    bool valid = false;
+};
+
+// isManaged: managedURL の記述(クエリ・フラグメントを含まない。ドメイン直後のスラッシュの有無に意味がある)
+ParsedHttpUrl ParseHttpUrl(const std::wstring& text, bool isManaged)
+{
+    ParsedHttpUrl r;
+    size_t schemeEnd = text.find(L"://");
+    if (schemeEnd == std::wstring::npos)
+    {
+        return r;
+    }
+    std::wstring scheme;
+    for (size_t i = 0; i < schemeEnd; i++)
+    {
+        scheme += (wchar_t)towlower(text[i]);
+    }
+    if (scheme != L"http" && scheme != L"https")
+    {
+        return r;
+    }
+    size_t authStart = schemeEnd + 3;
+    size_t authEnd = text.find_first_of(L"/?#", authStart);
+    if (authEnd == std::wstring::npos)
+    {
+        authEnd = text.size();
+    }
+    std::wstring authority = text.substr(authStart, authEnd - authStart);
+    // ユーザー情報("nhk.or.jp@evil.example" のような偽装)、IPv6、空白・バックスラッシュは扱わない
+    if (authority.empty() || authority.find_first_of(L"@[]\\ ") != std::wstring::npos)
+    {
+        return r;
+    }
+    std::wstring hostText = authority;
+    std::wstring port;
+    size_t colon = authority.rfind(L':');
+    if (colon != std::wstring::npos)
+    {
+        hostText = authority.substr(0, colon);
+        port = authority.substr(colon + 1);
+        if (port.empty() || port.find_first_not_of(L"0123456789") != std::wstring::npos)
+        {
+            return r;
+        }
+    }
+    std::wstring host;
+    for (wchar_t c : hostText)
+    {
+        wchar_t lower = (wchar_t)towlower(c);
+        bool ok = (lower >= L'a' && lower <= L'z') || (lower >= L'0' && lower <= L'9') || lower == L'-' || lower == L'.';
+        if (!ok)
+        {
+            return r;
+        }
+        host += lower;
+    }
+    if (host.empty())
+    {
+        return r;
+    }
+    if ((scheme == L"http" && port == L"80") || (scheme == L"https" && port == L"443"))
+    {
+        port.clear();
+    }
+    std::wstring rest = text.substr(authEnd);
+    bool hasPath = !rest.empty() && rest[0] == L'/';
+    std::wstring path;
+    if (isManaged)
+    {
+        if (rest.find_first_of(L"?#") != std::wstring::npos)
+        {
+            return r;
+        }
+        path = hasPath ? rest : L"";
+    }
+    else
+    {
+        size_t q = rest.find_first_of(L"?#");
+        path = rest.substr(0, q);
+        if (path.empty())
+        {
+            path = L"/";
+        }
+        hasPath = true;
+    }
+    r.scheme = scheme;
+    r.host = host;
+    r.port = port;
+    r.path = path;
+    r.hasPath = hasPath;
+    r.valid = true;
+    return r;
+}
+
+// ディレクトリ境界を守った前方一致("/sub" は "/sub" と "/sub/..." に一致し、"/subversion" には一致しない)
+bool PathContains(const std::wstring& managedPath, const std::wstring& docPath)
+{
+    std::wstring base = managedPath;
+    if (base.empty() || base.back() != L'/')
+    {
+        base += L'/';
+    }
+    return docPath == managedPath || docPath.compare(0, base.size(), base) == 0;
+}
+
+bool ManagedUrlMatches(const ParsedHttpUrl& m, const ParsedHttpUrl& doc)
+{
+    if (m.scheme != doc.scheme || m.port != doc.port)
+    {
+        return false;
+    }
+    if (m.hasPath)
+    {
+        // パスを書いた場合は、ドメインを厳格に解釈する(下位ドメインを含まない)
+        return m.host == doc.host && PathContains(m.path, doc.path);
+    }
+    // ドメインだけの場合は、下位のドメインを含む("." を挟んだ後方一致。"xnhk.or.jp" は含まない)
+    if (doc.host == m.host)
+    {
+        return true;
+    }
+    std::wstring suffix = L"." + m.host;
+    return doc.host.size() > suffix.size() &&
+        doc.host.compare(doc.host.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+}
+
+// ハイブリッドキャストのログを Plugins\TVTDataBroadcastingWV2\hybridcast.log に追記する(UTF-8, 1行1件)。
+// 2MBを超えたら hybridcast.old.log へ退避する(1世代)。WARN/ERROR はTVTestのログにも出す。
+void CDataBroadcastingWV2::HybridcastLog(const wchar_t* level, const std::wstring& message)
+{
+    if (!this->hybridcastLogEnabled)
+    {
+        return;
+    }
+    try
+    {
+        std::lock_guard<std::mutex> lock(this->hybridcastLogMutex);
+        // 暴走するアプリがログを埋め尽くさないよう、1回の起動での行数に上限を設ける
+        const int maxLines = 3000;
+        if (this->hybridcastLogLines > maxLines)
+        {
+            return;
+        }
+        this->hybridcastLogLines++;
+        std::wstring text = this->hybridcastLogLines > maxLines ? L"ログが多いため、以降の記録を省略します" : message;
+        // 1行にそろえる
+        for (auto& c : text)
+        {
+            if (c == L'\r' || c == L'\n')
+            {
+                c = L' ';
+            }
+        }
+        std::filesystem::path path = std::filesystem::path(this->baseDirectory) / L"hybridcast.log";
+        std::error_code ec;
+        auto size = std::filesystem::file_size(path, ec);
+        if (!ec && size > 2u * 1024u * 1024u)
+        {
+            std::filesystem::rename(path, path.parent_path() / L"hybridcast.old.log", ec);
+        }
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t head[96];
+        swprintf_s(head, L"%04d-%02d-%02d %02d:%02d:%02d.%03d [%ls] ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, level);
+        std::string line = wstrToUTF8String((std::wstring(head) + text).c_str());
+        line += "\r\n";
+        std::ofstream ofs(path, std::ios::binary | std::ios::app);
+        if (ofs)
+        {
+            ofs.write(line.data(), (std::streamsize)line.size());
+        }
+        if (wcscmp(level, L"INFO") != 0)
+        {
+            this->m_pApp->AddLog((L"TVTDataBroadcastingWV2: " + text).c_str());
+        }
+    }
+    catch (...)
+    {
+        // ログの失敗で本来の処理を止めない
+    }
+}
+
+// ログに書くURL。個人情報が含まれ得るクエリ・フラグメントと、ユーザー情報は、既定では記録しない(HybridcastLogFullUrl=1 で記録)
+std::wstring CDataBroadcastingWV2::HybridcastLogUrl(const std::wstring& url)
+{
+    if (this->hybridcastLogFullUrl)
+    {
+        return url;
+    }
+    std::wstring result = url;
+    size_t authStart = result.find(L"://");
+    if (authStart != std::wstring::npos)
+    {
+        authStart += 3;
+        size_t authEnd = result.find_first_of(L"/?#", authStart);
+        size_t at = result.find(L'@', authStart);
+        if (at != std::wstring::npos && (authEnd == std::wstring::npos || at < authEnd))
+        {
+            result.replace(authStart, at - authStart + 1, L"***@");
+        }
+    }
+    size_t cut = result.find_first_of(L"?#");
+    if (cut != std::wstring::npos)
+    {
+        result = result.substr(0, cut) + L"?(省略)";
+    }
+    if (result.size() > 300)
+    {
+        result = result.substr(0, 300) + L"...";
+    }
+    return result;
+}
+
+// アプリ(マネージド状態)の文書遷移を、バウンダリで判定する。バウンダリ外なら、アプリを終了して放送受信映像のみにする
+// (IPTVFJ STD-0010 7.6.1 / STD-0013 8.1.3.10.2)。遷移先はすべてログに残す(どのサイトに誘導されたかを調べるため)。
+void CDataBroadcastingWV2::OnHybridcastNavigationStarting(ICoreWebView2NavigationStartingEventArgs* args, bool isMainFrame)
+{
+    if (!this->InHybridcastMode())
+    {
+        return;
+    }
+    wil::unique_cotaskmem_string uri;
+    if (FAILED(args->get_Uri(uri.put())) || !uri)
+    {
+        return;
+    }
+    BOOL redirected = FALSE;
+    args->get_IsRedirected(&redirected);
+    BOOL userInitiated = FALSE;
+    args->get_IsUserInitiated(&userInitiated);
+    std::wstring detail = std::wstring(isMainFrame ? L"遷移" : L"遷移(フレーム)") + (redirected ? L"[リダイレクト] " : L" ") +
+        (userInitiated ? L"[操作] " : L"") + this->HybridcastLogUrl(uri.get());
+    if (this->hybridcast.unmanaged)
+    {
+        this->HybridcastLog(L"INFO", L"アンマネージド状態の" + detail);
+        return;
+    }
+    if (!_wcsicmp(uri.get(), L"about:blank") || !_wcsicmp(uri.get(), L"about:srcdoc") || this->IsInHybridcastBoundary(uri.get()))
+    {
+        this->HybridcastLog(L"INFO", detail);
+        return;
+    }
+    this->HybridcastLog(L"WARN", L"バウンダリ外への" + detail + L" -> アプリを終了します");
+    args->put_Cancel(TRUE);
+    PostMessageW(this->hMessageWnd, WM_APP_HYBRIDCAST_EXIT, 1, 0);
+}
+
+// アプリのJavaScriptの例外(Runtime.exceptionThrown)と console.error(Runtime.consoleAPICalled)をログに残す
+void CDataBroadcastingWV2::OnHybridcastDevToolsEvent(bool isException, const wchar_t* json)
+{
+    try
+    {
+        auto j = nlohmann::json::parse(wstrToUTF8String(json), nullptr, false);
+        if (j.is_discarded() || !j.is_object())
+        {
+            return;
+        }
+        std::wstring text;
+        if (isException)
+        {
+            auto details = j.value("exceptionDetails", nlohmann::json::object());
+            std::string message = details.value("text", std::string());
+            if (details.contains("exception") && details["exception"].is_object())
+            {
+                message = details["exception"].value("description", message);
+            }
+            std::string url = details.value("url", std::string());
+            int line = details.value("lineNumber", -1);
+            text = L"JavaScriptの例外: " + utf8StrToWString(message.c_str());
+            if (!url.empty())
+            {
+                text += L" (" + this->HybridcastLogUrl(utf8StrToWString(url.c_str())) + L":" + std::to_wstring(line) + L")";
+            }
+        }
+        else
+        {
+            std::string type = j.value("type", std::string());
+            if (type != "error" && type != "assert")
+            {
+                return;
+            }
+            std::string joined;
+            if (j.contains("args") && j["args"].is_array())
+            {
+                for (auto& a : j["args"])
+                {
+                    if (!joined.empty())
+                    {
+                        joined += " ";
+                    }
+                    if (a.is_object() && a.contains("value"))
+                    {
+                        joined += a["value"].is_string() ? a["value"].get<std::string>() : a["value"].dump();
+                    }
+                    else if (a.is_object() && a.contains("description") && a["description"].is_string())
+                    {
+                        joined += a["description"].get<std::string>();
+                    }
+                }
+            }
+            text = L"console." + utf8StrToWString(type.c_str()) + L": " + utf8StrToWString(joined.c_str());
+        }
+        if (text.size() > 500)
+        {
+            text = text.substr(0, 500) + L"...";
+        }
+        this->HybridcastLog(L"ERROR", text);
+    }
+    catch (...)
+    {
+    }
+}
+
+// アプリケーションバウンダリ内の文書か(IPTVFJ STD-0013 6.1.3.1 表 6-1 の規則)
+bool CDataBroadcastingWV2::IsInHybridcastBoundary(const wchar_t* url) const
+{
+    if (!url)
+    {
+        return false;
+    }
+    ParsedHttpUrl doc = ParseHttpUrl(url, false);
+    if (!doc.valid)
+    {
+        return false;
+    }
+    for (const auto& managed : this->hybridcast.boundary)
+    {
+        ParsedHttpUrl m = ParseHttpUrl(managed, true);
+        if (m.valid && ManagedUrlMatches(m, doc))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// resources/dist/hybridcast_api.js を、アプリごとの初期情報つきで注入するスクリプトにする
+std::wstring CDataBroadcastingWV2::BuildHybridcastScript(const std::string& initJson) const
+{
+    std::ifstream ifs(std::filesystem::path(this->hybridcast.apiScriptPath), std::ios::binary);
+    if (!ifs)
+    {
+        return L"";
+    }
+    std::string bundle((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    // 最上位のページでのみ有効にする(iframeでは chrome.webview が使えない可能性があるため何もしない)
+    std::string js =
+        "(function(){\n"
+        "if (window.top !== window || !(window.chrome && window.chrome.webview)) return;\n" +
+        bundle +
+        "\n;HybridcastApi.installHybridcastApi(window," + initJson +
+        ",{post:function(m){window.chrome.webview.postMessage(m);},"
+        "listen:function(h){window.chrome.webview.addEventListener('message',function(e){h(e.data);});}});\n"
+        "})();";
+    return utf8StrToWString(js.c_str());
+}
+
+// IPTVFJ STD-0013 8.1.4.1.1.8 の書式:
+//   User-Agent: <others> Hybridcast/1.0 (<Capability>;<MakerId>;<ModelId>;<MajorVer>;<MinorVer>;<reserved>) <others>
+// <others> には、ブラウザエンジンを判別できるよう元のUser-Agentを含める。
+// MakerId は製造メーカーのIEEE OUI(6桁の16進)。他社のIDを名乗らないよう、既定は 000000。必要ならiniで指定する。
+std::wstring CDataBroadcastingWV2::BuildHybridcastUserAgent(const std::wstring& baseUserAgent)
+{
+    auto sanitize = [](const std::wstring& in, size_t maxLen) {
+        std::wstring out;
+        for (wchar_t c : in)
+        {
+            bool ok = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || c == L'-' || c == L'_' || c == L'.';
+            out += ok ? c : L'_';
+            if (out.size() >= maxLen)
+            {
+                break;
+            }
+        }
+        return out;
+    };
+    std::wstring makerId = this->GetIniItem(L"HybridcastMakerId", L"000000");
+    bool validMakerId = makerId.size() == 6;
+    for (wchar_t c : makerId)
+    {
+        validMakerId = validMakerId && ((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F') || (c >= L'a' && c <= L'f'));
+    }
+    if (!validMakerId)
+    {
+        makerId = L"000000";
+    }
+    std::wstring modelId = sanitize(this->GetIniItem(L"HybridcastModelId", L"TVTDataBroadcastingWV2"), 32);
+    std::wstring ua = baseUserAgent;
+    ua += L" Hybridcast/1.0 (HD,HD;";
+    ua += makerId;
+    ua += L";";
+    ua += modelId;
+    ua += L";1;0;)";
+    return ua;
+}
+
+void CDataBroadcastingWV2::RestoreHybridcastMute()
+{
+    if (this->hybridcast.savedMuteValid)
+    {
+        this->hybridcast.savedMuteValid = false;
+        this->m_pApp->SetMute(this->hybridcast.savedMute);
+    }
+}
+
+// ハイブリッドキャストの状態(マネージド/アンマネージド)を終了し、注入スクリプト・User-Agent・音声を元に戻す
+void CDataBroadcastingWV2::LeaveHybridcastState()
+{
+    this->hybridcast.active = false;
+    this->hybridcast.unmanaged = false;
+    this->hybridcast.launching = false;
+    // addPermissionManagedArea で追加した領域も、アプリの終了時に初期化される(STD-0011 3.1.3.3)
+    this->hybridcast.boundary.clear();
+    if (this->webView)
+    {
+        if (!this->hybridcast.scriptId.empty())
+        {
+            this->webView->RemoveScriptToExecuteOnDocumentCreated(this->hybridcast.scriptId.c_str());
+            this->webView->CallDevToolsProtocolMethod(L"Runtime.disable", L"{}", nullptr);
+        }
+        if (!this->hybridcast.savedUserAgent.empty())
+        {
+            wil::com_ptr<ICoreWebView2Settings> settings;
+            if (SUCCEEDED(this->webView->get_Settings(settings.put())))
+            {
+                auto settings2 = settings.try_query<ICoreWebView2Settings2>();
+                if (settings2)
+                {
+                    settings2->put_UserAgent(this->hybridcast.savedUserAgent.c_str());
+                }
+            }
+        }
+    }
+    this->hybridcast.scriptId.clear();
+    this->hybridcast.savedUserAgent.clear();
+    this->RestoreHybridcastMute();
+}
+
+void CDataBroadcastingWV2::LaunchHybridcast(const nlohmann::json& message)
+{
+    if (!this->webView)
+    {
+        return;
+    }
+    // 通信が無効なら起動しない
+    if (!this->enableNetwork)
+    {
+        this->HybridcastLog(L"WARN", L"起動要求を無視しました: 通信が無効です(Plugins\\TVTDataBroadcastingWV2.ini の EnableNetwork=1 が必要)");
+        return;
+    }
+    // 実行中・起動処理中の二重起動もしない
+    if (this->InHybridcastMode() || this->hybridcast.launching)
+    {
+        this->HybridcastLog(L"WARN", L"起動要求を無視しました: すでにアプリを実行中(または起動処理中)です");
+        return;
+    }
+    try
+    {
+        {
+            std::lock_guard<std::mutex> lock(this->hybridcastLogMutex);
+            this->hybridcastLogLines = 0; // ログの行数の上限は、起動ごとに数え直す
+        }
+        auto entryUrl = utf8StrToWString(message.at("entryUrl").get<std::string>().c_str());
+        auto init = message.at("init");
+        this->HybridcastLog(L"INFO", L"起動要求: " + this->HybridcastLogUrl(entryUrl) +
+            L" (組織識別=" + std::to_wstring(init.value("organizationId", -1)) +
+            L" アプリ識別=" + std::to_wstring(init.value("applicationId", -1)) + L")");
+        if (_wcsnicmp(entryUrl.c_str(), L"http://", 7) && _wcsnicmp(entryUrl.c_str(), L"https://", 8))
+        {
+            this->HybridcastLog(L"WARN", L"起動要求を無視しました: 起動URLが http/https ではありません");
+            return;
+        }
+        std::vector<std::wstring> boundary;
+        for (auto& u : message.at("boundaryUrls"))
+        {
+            boundary.push_back(utf8StrToWString(u.get<std::string>().c_str()));
+        }
+        auto script = this->BuildHybridcastScript(init.dump());
+        if (script.empty())
+        {
+            this->HybridcastLog(L"ERROR", L"起動できません: 拡張APIのスクリプトを読み込めません: " + this->hybridcast.apiScriptPath);
+            return;
+        }
+        this->hybridcast.launching = true;
+        this->hybridcast.networkId = this->currentChannel.NetworkID;
+        this->hybridcast.serviceId = this->currentService.ServiceID;
+        this->hybridcast.consumedKey = ((long long)this->hybridcast.networkId << 16) | this->hybridcast.serviceId;
+        this->hybridcast.boundary = std::move(boundary);
+        this->hybridcast.savedMute = this->m_pApp->GetMute();
+        this->hybridcast.savedMuteValid = true;
+        // アプリへの通信のUser-Agentを、仕様の書式にする(アプリ終了時に元へ戻す)
+        wil::com_ptr<ICoreWebView2Settings> settings;
+        if (SUCCEEDED(this->webView->get_Settings(settings.put())))
+        {
+            auto settings2 = settings.try_query<ICoreWebView2Settings2>();
+            if (settings2)
+            {
+                wil::unique_cotaskmem_string baseUserAgent;
+                if (SUCCEEDED(settings2->get_UserAgent(baseUserAgent.put())) && baseUserAgent)
+                {
+                    this->hybridcast.savedUserAgent = baseUserAgent.get();
+                    auto userAgent = this->BuildHybridcastUserAgent(baseUserAgent.get());
+                    settings2->put_UserAgent(userAgent.c_str());
+                    this->HybridcastLog(L"INFO", L"User-Agent: " + userAgent);
+                }
+            }
+        }
+        HRESULT hr = this->webView->AddScriptToExecuteOnDocumentCreated(script.c_str(),
+            Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
+                [this, entryUrl](HRESULT result, PCWSTR id) -> HRESULT {
+            if (FAILED(result) || !this->hybridcast.launching)
+            {
+                this->HybridcastLog(L"ERROR", L"起動できません: 拡張APIの登録に失敗しました hr=" + std::to_wstring((long)result));
+                if (SUCCEEDED(result) && id)
+                {
+                    this->webView->RemoveScriptToExecuteOnDocumentCreated(id);
+                }
+                this->LeaveHybridcastState();
+                return result;
+            }
+            // 起動処理中に選局されていたら、起動を中止する
+            if (this->hybridcast.serviceId != this->currentService.ServiceID ||
+                this->hybridcast.networkId != this->currentChannel.NetworkID)
+            {
+                this->HybridcastLog(L"WARN", L"起動を中止しました: 起動処理中に選局されました");
+                this->webView->RemoveScriptToExecuteOnDocumentCreated(id);
+                this->LeaveHybridcastState();
+                return S_OK;
+            }
+            this->hybridcast.scriptId = id;
+            this->hybridcast.launching = false;
+            this->hybridcast.active = true;
+            // アプリのJavaScriptの例外とconsole.errorを受け取れるようにする
+            this->webView->CallDevToolsProtocolMethod(L"Runtime.enable", L"{}", nullptr);
+            this->HybridcastLog(L"INFO", L"アプリの読み込みを開始します: " + this->HybridcastLogUrl(entryUrl));
+            this->webView->Navigate(entryUrl.c_str());
+            return S_OK;
+        }).Get());
+        if (FAILED(hr))
+        {
+            this->HybridcastLog(L"ERROR", L"起動できません: 拡張APIの登録を開始できません hr=" + std::to_wstring((long)hr));
+            this->LeaveHybridcastState();
+        }
+    }
+    catch (const std::exception&)
+    {
+        this->HybridcastLog(L"ERROR", L"起動要求の内容が不正なため、無視しました");
+        this->LeaveHybridcastState();
+    }
+}
+
+// マネージド状態を終了する。videoOnly なら「放送受信映像のみ」の状態へ(STD-0013 8.1.3.10.1, 8.1.3.10.2)
+void CDataBroadcastingWV2::ExitHybridcast(bool videoOnly)
+{
+    if (!this->InHybridcastMode())
+    {
+        return;
+    }
+    this->HybridcastLog(L"INFO", videoOnly ? L"アプリを終了しました: 放送受信映像のみの状態に戻ります" : L"アプリを終了しました: データ放送に戻ります");
+    long long key = ((long long)this->hybridcast.networkId << 16) | this->hybridcast.serviceId;
+    this->LeaveHybridcastState();
+    this->hybridcast.videoOnlyKey = videoOnly ? key : 0;
+    // 起動したサービスのデータ放送ページへ戻る(同じサービスでのAIT自動起動は consumedKey で抑止される)
+    this->Tune();
+}
+
+// exitFromManagedState: 一般アプリケーションへ、アンマネージド状態で遷移する(STD-0011 3.1.3.3, STD-0013 8.1.3.10.1)。
+// 映像・音声は直ちに提示を中止する。拡張APIは注入しない。選局でサービスが変わったら終了する。
+void CDataBroadcastingWV2::EnterUnmanaged(const std::wstring& uri)
+{
+    if (!this->hybridcast.active || !this->webView)
+    {
+        return;
+    }
+    this->HybridcastLog(L"INFO", L"アプリが一般アプリケーションへの遷移を要求しました(映像と音声を止めます): " + this->HybridcastLogUrl(uri));
+    // 音声の元の状態(savedMute)は保ったまま、スクリプトとUser-Agentだけを元に戻す
+    bool savedMuteValid = this->hybridcast.savedMuteValid;
+    bool savedMute = this->hybridcast.savedMute;
+    this->hybridcast.savedMuteValid = false;
+    this->LeaveHybridcastState();
+    this->hybridcast.savedMuteValid = savedMuteValid;
+    this->hybridcast.savedMute = savedMute;
+    this->hybridcast.unmanaged = true;
+    this->m_pApp->SetMute(true);
+    this->invisible = false;
+    this->videoRect = RECT{ 0, 0, 1, 1 };
+    this->ResizeVideoWindow();
+    this->webView->Navigate(uri.c_str());
+}
+
+// ハイブリッドキャストのアプリ(外部ページ)から届いたメッセージ。プラグイン用のメッセージは一切受け付けない。
+void CDataBroadcastingWV2::OnHybridcastAppMessage(const std::string& type, const nlohmann::json& a)
+{
+    // マネージド状態のアプリからだけ受け付ける(通常時やアンマネージド中の外部ページは無視)
+    if (!this->hybridcast.active)
+    {
+        std::wstring shortType = utf8StrToWString(type.substr(0, 64).c_str());
+        this->HybridcastLog(L"WARN", L"プラグイン以外のページからのメッセージを無視しました: " + shortType);
+        return;
+    }
+    try
+    {
+        if (type != "videoChanged")
+        {
+            this->HybridcastLog(L"INFO", L"アプリからの要求: " + utf8StrToWString(type.substr(0, 64).c_str()));
+        }
+        if (type == "videoChanged")
+        {
+            auto left = a.at("left").get<double>();
+            auto right = a.at("right").get<double>();
+            auto top = a.at("top").get<double>();
+            auto bottom = a.at("bottom").get<double>();
+            auto inRange = [](double v) { return v > -100000.0 && v < 100000.0; };
+            if (!inRange(left) || !inRange(right) || !inRange(top) || !inRange(bottom))
+            {
+                return;
+            }
+            RECT r;
+            r.left = (int)std::floor(left);
+            r.right = (int)std::ceil(right);
+            r.top = (int)std::floor(top);
+            r.bottom = (int)std::ceil(bottom);
+            this->invisible = false;
+            this->videoRect = r;
+            this->ResizeVideoWindow();
+        }
+        else if (type == "hc.audioMute")
+        {
+            this->m_pApp->SetMute(a.at("enable").get<bool>());
+        }
+        else if (type == "hc.destroyApplication")
+        {
+            this->ExitHybridcast(true);
+        }
+        else if (type == "hc.launchDataBroadcastingBrowser")
+        {
+            this->ExitHybridcast(false);
+        }
+        else if (type == "hc.exitFromManagedState")
+        {
+            auto uri = utf8StrToWString(a.at("uri").get<std::string>().c_str());
+            // 最大250文字のhttp/https(STD-0013 表 8-11)。API側でも検査済みだが、ホスト側でも再検査する
+            if (uri.empty() || uri.size() > 250 ||
+                (_wcsnicmp(uri.c_str(), L"http://", 7) && _wcsnicmp(uri.c_str(), L"https://", 8)))
+            {
+                this->HybridcastLog(L"WARN", L"exitFromManagedState の遷移先が不正なため、無視しました");
+                return;
+            }
+            this->EnterUnmanaged(uri);
+        }
+        else if (type == "hc.addPermissionManagedArea")
+        {
+            // バウンダリの拡張(STD-0010 7.6.1)。urls が null(その他すべてのロケーション)は、安全のためバウンダリに含めない
+            if (a.contains("urls") && a["urls"].is_array())
+            {
+                for (auto& u : a["urls"])
+                {
+                    auto url = utf8StrToWString(u.get<std::string>().c_str());
+                    if (ParseHttpUrl(url, true).valid)
+                    {
+                        this->hybridcast.boundary.push_back(url);
+                        this->HybridcastLog(L"INFO", L"バウンダリを追加しました: " + this->HybridcastLogUrl(url));
+                    }
+                }
+            }
+        }
+    }
+    catch (const std::exception&)
+    {
+        // 型違いなど不正なメッセージは無視する
     }
 }
 

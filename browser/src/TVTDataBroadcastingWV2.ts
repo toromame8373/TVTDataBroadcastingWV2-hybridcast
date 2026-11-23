@@ -1,3 +1,5 @@
+import { launchHybridcastFromAit } from "./hybridcast/launch";
+import { installBmlAitBridge } from "./hybridcast/bml_bridge";
 import type { ComponentPMT, ResponseMessage } from "web-bml/protocol";
 import { BMLBrowser, BMLBrowserFontFace, EPG, Indicator, IP, InputApplication, InputCancelReason, InputCharacterType } from "web-bml";
 import { decodeTS } from "web-bml/ts";
@@ -74,6 +76,18 @@ export class StatusBarIndicator implements Indicator {
 const params = new URLSearchParams(location.search);
 const networkId = Number(params.get("networkId")) ?? undefined;
 const serviceId = Number(params.get("serviceId")) ?? undefined;
+// 試験用: AITのURLが指定されていれば、ハイブリッドキャストアプリの起動を試みる(Plugins/TVTDataBroadcastingWV2.ini の HybridcastAitUrl)
+const hybridcastAitUrl = params.get("hybridcastAit");
+// ハイブリッドキャストアプリの終了後は「放送受信映像のみ」の状態にする(STD-0013 8.1.3.10.2)。
+// データ放送(BML)は裏で動かしたまま非表示にし、リモコン操作があるまで表示しない。
+let videoOnlyHold = params.get("videoOnly") === "1";
+// BMLの startAITControlledApp() などからHTMLアプリを起動できるようにする(web-bml側の修正 patches/web-bml が呼び出す)
+// ハイブリッドキャスト関連のログは、プラグイン側のログファイル(Plugins/TVTDataBroadcastingWV2/hybridcast.log)にも送る
+function hybridcastLog(level: "info" | "warn" | "error", text: string): void {
+    console[level === "info" ? "log" : level]("hybridcast:", text);
+    window.chrome.webview.postMessage({ type: "hybridcastLog", level, text });
+}
+installBmlAitBridge((msg) => window.chrome.webview.postMessage(msg), hybridcastLog);
 
 // BML文書と動画と字幕が入る要素
 const browserElement = document.getElementById("data-broadcasting-browser")!;
@@ -271,6 +285,9 @@ function isFullScreenVideo(): boolean {
 // trueであればデータ放送の上に動画を表示させる非表示状態
 bmlBrowser.addEventListener("invisible", (evt) => {
     console.log("invisible", evt.detail);
+    if (videoOnlyHold && !evt.detail) {
+        return;
+    }
     if (evt.detail) {
         contentElement.style.clipPath = "inset(0px)";
     } else {
@@ -281,6 +298,14 @@ bmlBrowser.addEventListener("invisible", (evt) => {
         invisible: evt.detail || isFullScreenVideo(),
     });
 });
+
+if (videoOnlyHold) {
+    contentElement.style.clipPath = "inset(0px)";
+    postMessage({
+        type: "invisible",
+        invisible: true,
+    });
+}
 
 bmlBrowser.addEventListener("load", (evt) => {
     console.log("load", evt.detail);
@@ -543,6 +568,7 @@ function onWebViewMessage(data: ToWebViewMessage, reply: (data: FromWebViewMessa
             player.updateTime(curPCR - 450);
         }
     } else if (data.type === "key") {
+        videoOnlyHold = false;
         remoteControlStatusContainer.style.visibility = "visible";
         bmlBrowser.content.processKeyDown(data.keyCode);
         bmlBrowser.content.processKeyUp(data.keyCode);
@@ -644,3 +670,9 @@ window.addEventListener("resize", onResized);
 onResized();
 
 window.bmlBrowser = bmlBrowser;
+
+if (hybridcastAitUrl) {
+    launchHybridcastFromAit(hybridcastAitUrl, (msg) => window.chrome.webview.postMessage(msg)).catch((e) => {
+        hybridcastLog("error", `ini の HybridcastAitUrl からの起動に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    });
+}
