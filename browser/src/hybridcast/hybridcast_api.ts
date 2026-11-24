@@ -285,6 +285,8 @@ export function installHybridcastApi(win: any, init: AppInit, transport: Transpo
     //   sendTextToCompanionDevice(text)               … 端末連携への送信(1箇所、戻り値は未使用)
     //   addCompanionDeviceTextMessageListener(fn)     … 端末連携からの受信登録(1箇所)
     //   setURLForCompanionDevice(url, options)        … 端末連携へのURL提示(1箇所、戻り値は未使用)
+    // なお NHK アプリ本体(p/index.js)は getSystemInformation(null) も呼ぶ
+    // (makerid/modelname/browsername/browserversion を読む。FIX2 時点では未提供だった)。
     // 実装方針(bmlCompat と同じ、文書内に閉じた実装):
     //   - sourceIs("onair") は true。このプラグインではアプリは選局中の放送から起動し、
     //     選局が変わればアプリは終了するので、アプリの生存中は常に対象の放送を受信している。
@@ -336,6 +338,18 @@ export function installHybridcastApi(win: any, init: AppInit, transport: Transpo
 
     const receiverDevice = {
         streamEvent,
+        getSystemInformation(_arg?: unknown): { makerid: string; modelname: string; browsername: string; browserversion: string } {
+            // NHK アプリ本体(p/index.js)が初期化で呼ぶ。実機では端末の製造元・機種名
+            // などが返るが、このプラグインに実機情報は無いため中立な値を返す。
+            // makerid を "" にすることで、SHARP("11")・SONY("12")専用の
+            // tv-sc.nhk.jp への SSL 可否確認 POST は走らない(アプリ側の分岐による)。
+            return {
+                makerid: "",
+                modelname: "TVTDataBroadcastingWV2",
+                browsername: "WebView2",
+                browserversion: "",
+            };
+        },
         getCurrentEventInformation(callback: unknown): void {
             if (typeof callback !== "function") return;
             // 番組情報は提供できないため、undefined(情報なし)で応答する
